@@ -28,6 +28,7 @@
  * \author Dave Bowerman <david.bowerman@gmail.com>
  * \author Dmitry Vagin <dmitry2004@yandex.ru>
  * \author bg <bg_one@mail.ru>
+ * \author Max von Buelow <max@m9x.de>
  *
  * \ingroup channel_drivers
  */
@@ -69,6 +70,8 @@ ASTERISK_FILE_VERSION(__FILE__, "$Rev: " PACKAGE_REVISION " $")
 #include "channel.h"			/* channel_queue_hangup() */
 #include "dc_config.h"			/* dc_uconfig_fill() dc_gconfig_fill() dc_sconfig_fill()  */
 #include "pdiscovery.h"			/* pdiscovery_lookup() pdiscovery_init() pdiscovery_fini() */
+#include "smsdb.h"
+#include "error.h"
 
 EXPORT_DEF const char * const dev_state_strs[4] = { "stop", "restart", "remove", "start" };
 EXPORT_DEF public_state_t * gpublic;
@@ -116,7 +119,11 @@ static int lock_build(const char * devname, char * buf, unsigned length)
 		basename = devname;
 
 	/* NOTE: use system system wide lock directory */
+	#if defined(__FreeBSD__)
+	return snprintf(buf, length, "/var/spool/lock/LCK..%s", basename);
+	#else
 	return snprintf(buf, length, "/var/lock/LCK..%s", basename);
+	#endif
 }
 
 #/* return 0 on error */
@@ -299,8 +306,6 @@ static void disconnect_dongle (struct pvt* pvt)
 	{
 		/* unaffected in case of restart */
 		pvt->use_ucs2_encoding = 0;
-		pvt->cusd_use_7bit_encoding = 0;
-		pvt->cusd_use_ucs2_decoding = 1;
 		pvt->gsm_reg_status = -1;
 		pvt->rssi = 0;
 		pvt->linkmode = 0;
@@ -321,12 +326,10 @@ static void disconnect_dongle (struct pvt* pvt)
 		pvt->has_sms = 0;
 		pvt->has_voice = 0;
 		pvt->has_call_waiting = 0;
-		pvt->use_pdu = 0;
 	}
 
 	pvt->connected		= 0;
 	pvt->initialized	= 0;
-	pvt->use_pdu		= 0;
 	pvt->has_call_waiting	= 0;
 
 	/* FIXME: LOST real device state */
@@ -334,7 +337,7 @@ static void disconnect_dongle (struct pvt* pvt)
 	pvt->ring = 0;
 	pvt->cwaiting = 0;
 	pvt->outgoing_sms = 0;
-	pvt->incoming_sms = 0;
+	pvt->incoming_sms_index = -1U;
 	pvt->volume_sync_step = VOLUME_SYNC_BEGIN;
 
 	pvt->current_state = DEV_STATE_STOPPED;
@@ -350,6 +353,50 @@ static void disconnect_dongle (struct pvt* pvt)
 	manager_event_device_status(PVT_ID(pvt), "Disconnect");
 }
 
+#define SMS_INBOX_BIT(index)    ((sms_inbox_item_type)(1) << (index % SMS_INBOX_ITEM_BITS))
+#define SMS_INBOX_INDEX(index)  (index / SMS_INBOX_ITEM_BITS)
+
+static int is_sms_inbox_index_valid(const struct pvt* pvt, int index)
+{
+	if (index < 0 || index >= (int) SMS_INDEX_MAX) {
+		ast_log(LOG_WARNING, "[%s] SMS index [%d] out of range\n", PVT_ID(pvt), index);
+		return 0;
+	}
+
+	return 1;
+}
+
+EXPORT_DEF int sms_inbox_set(struct pvt* pvt, int index)
+{
+	if (!is_sms_inbox_index_valid(pvt, index)) {
+		return 0;
+	}
+
+	pvt->incoming_sms_inbox[SMS_INBOX_INDEX(index)] |= SMS_INBOX_BIT(index);
+	return 1;
+}
+
+EXPORT_DEF int sms_inbox_clear(struct pvt* pvt, int index)
+{
+	if (!is_sms_inbox_index_valid(pvt, index)) {
+		return 0;
+	}
+
+	pvt->incoming_sms_inbox[SMS_INBOX_INDEX(index)] &= ~SMS_INBOX_BIT(index);
+	return 1;
+}
+
+EXPORT_DEF int is_sms_inbox_set(const struct pvt* pvt, int index)
+{
+	if (!is_sms_inbox_index_valid(pvt, index)) {
+		return 0;
+	}
+
+	return pvt->incoming_sms_inbox[SMS_INBOX_INDEX(index)] & SMS_INBOX_BIT(index);
+}
+
+#undef SMS_INBOX_INDEX
+#undef SMS_INBOX_BIT
 
 /* anybody wrote some to device before me, and not read results, clean pending results here */
 #/* */
@@ -369,6 +416,28 @@ EXPORT_DEF void clean_read_data(const char * devname, int fd)
 		rb_init (&rb, buf, sizeof (buf));
 		if (iovcnt == 0)
 			break;
+	}
+}
+
+static void handle_expired_reports(struct pvt *pvt)
+{
+	char dst[SMSDB_DST_MAX_LEN];
+	char payload[SMSDB_PAYLOAD_MAX_LEN];
+	ssize_t payload_len = smsdb_outgoing_purge_one(dst, payload);
+	if (payload_len >= 0) {
+		ast_verb (3, "[%s] TTL payload: %.*s\n", PVT_ID(pvt), (int) payload_len, payload);
+		channel_var_t vars[] =
+		{
+			{ "SMS_REPORT_PAYLOAD", payload },
+			{ "SMS_REPORT_TS", "" },
+			{ "SMS_REPORT_DT", "" },
+			{ "SMS_REPORT_SUCCESS", "0" },
+			{ "SMS_REPORT_TYPE", "t" },
+			{ "SMS_REPORT", "" },
+			{ NULL, NULL },
+		};
+		start_local_channel(pvt, "report", dst, vars);
+		manager_event_report(PVT_ID(pvt), payload, payload_len, "", "", 0, 2, "");
 	}
 }
 
@@ -405,10 +474,16 @@ static void* do_monitor_phone (void* data)
 	clean_read_data(dev, fd);
 
 	/* schedule dongle initilization  */
-	if (at_enque_initialization (&pvt->sys_chan, CMD_AT))
+	if (at_enqueue_initialization(&pvt->sys_chan, CMD_AT))
 	{
 		ast_log (LOG_ERROR, "[%s] Error adding initialization commands to queue\n", dev);
 		goto e_cleanup;
+	}
+
+	/* Poll first SMS, if any */
+	if (at_poll_sms(pvt) == 0)
+	{
+		ast_debug (1, "[%s] Polling first SMS message\n", PVT_ID(pvt));
 	}
 
 	ast_mutex_unlock (&pvt->lock);
@@ -417,6 +492,8 @@ static void* do_monitor_phone (void* data)
 	while (1)
 	{
 		ast_mutex_lock (&pvt->lock);
+
+		handle_expired_reports(pvt);
 
 		if (port_status (pvt->data_fd) || port_status (pvt->audio_fd))
 		{
@@ -445,7 +522,7 @@ static void* do_monitor_phone (void* data)
 				ast_log (LOG_ERROR, "[%s] timedout while waiting '%s' in response to '%s'\n", dev, at_res2str (ecmd->res), at_cmd2str (ecmd->cmd));
 				goto e_cleanup;
 			}
-			at_enque_ping(&pvt->sys_chan);
+			at_enqueue_ping(&pvt->sys_chan);
 			ast_mutex_unlock (&pvt->lock);
 			continue;
 		}
@@ -935,24 +1012,19 @@ EXPORT_DEF struct pvt * find_device_ex(struct public_state * state, const char *
 }
 
 #/* return locked pvt or NULL */
-EXPORT_DEF struct pvt * find_device_ext (const char * name, const char ** reason)
+EXPORT_DEF struct pvt * find_device_ext (const char * name)
 {
-	char * res = "";
 	struct pvt * pvt = find_device(name);
 
-	if(pvt)
-	{
-		if(!pvt_enabled(pvt))
-		{
+	if (pvt) {
+		if (!pvt_enabled(pvt)) {
 			ast_mutex_unlock (&pvt->lock);
-			res = "device disabled";
+			chan_dongle_err = E_DEVICE_DISABLED;
 			pvt = NULL;
 		}
+	} else {
+		chan_dongle_err = E_DEVICE_NOT_FOUND;
 	}
-	else
-		res = "no such device";
-	if(reason)
-		*reason = res;
 	return pvt;
 }
 
@@ -1227,7 +1299,7 @@ EXPORT_DEF const char* pvt_str_state(const struct pvt* pvt)
 			state = pvt_call_dir(pvt);
 		else if(PVT_STATE(pvt, chan_count[CALL_STATE_ONHOLD]) > 0)
 			state = "Held";
-		else if(pvt->outgoing_sms || pvt->incoming_sms)
+		else if(pvt->outgoing_sms || pvt->incoming_sms_index != -1U)
 			state = "SMS";
 		else
 			state = "Free";
@@ -1265,7 +1337,7 @@ EXPORT_DEF struct ast_str* pvt_str_state_ex(const struct pvt* pvt)
 		if(PVT_STATE(pvt, chan_count[CALL_STATE_ONHOLD]) > 0)
 			ast_str_append (&buf, 0, "Held %u ", PVT_STATE(pvt, chan_count[CALL_STATE_ONHOLD]));
 
-		if(pvt->incoming_sms)
+		if(pvt->incoming_sms_index != -1U)
 			ast_str_append (&buf, 0, "Incoming SMS ");
 
 		if(pvt->outgoing_sms)
@@ -1423,8 +1495,8 @@ static struct pvt * pvt_create(const pvt_config_t * settings)
 		pvt->audio_fd			= -1;
 		pvt->data_fd			= -1;
 		pvt->timeout			= DATA_READ_TIMEOUT;
-		pvt->cusd_use_ucs2_decoding	=  1;
 		pvt->gsm_reg_status		= -1;
+		pvt->incoming_sms_index		= -1U;
 
 		ast_copy_string (pvt->provider_name, "NONE", sizeof (pvt->provider_name));
 		ast_copy_string (pvt->subscriber_number, "Unknown", sizeof (pvt->subscriber_number));
@@ -1450,7 +1522,7 @@ static int pvt_time4restate(const struct pvt * pvt)
 {
 	if(pvt->desired_state != pvt->current_state)
 	{
-		if(pvt->restart_time == RESTATE_TIME_NOW || (PVT_NO_CHANS(pvt) && !pvt->outgoing_sms && !pvt->incoming_sms))
+		if(pvt->restart_time == RESTATE_TIME_NOW || (PVT_NO_CHANS(pvt) && !pvt->outgoing_sms && pvt->incoming_sms_index == -1U))
 			return 1;
 	}
 	return 0;
@@ -1493,7 +1565,6 @@ static int pvt_reconfigure(struct pvt * pvt, const pvt_config_t * settings, rest
 			|| strcmp(UCONFIG(settings, imsi), CONF_UNIQ(pvt, imsi))
 			|| SCONFIG(settings, u2diag) != CONF_SHARED(pvt, u2diag)
 			|| SCONFIG(settings, resetdongle) != CONF_SHARED(pvt, resetdongle)
-			|| SCONFIG(settings, smsaspdu) != CONF_SHARED(pvt, smsaspdu)
 			|| SCONFIG(settings, callwaiting) != CONF_SHARED(pvt, callwaiting))
 		{
 			/* TODO: schedule restart */
@@ -1696,6 +1767,7 @@ static int public_state_init(struct public_state * state)
 			/* register our channel type */
 			if(ast_channel_register(&channel_tech) == 0)
 			{
+				smsdb_init();
 				cli_register();
 
 				app_register();
@@ -1766,6 +1838,7 @@ static int unload_module()
 	pdiscovery_fini();
 
 	ast_free(gpublic);
+	smsdb_atexit();
 	gpublic = NULL;
 	return 0;
 }

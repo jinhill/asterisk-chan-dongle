@@ -23,6 +23,13 @@ AC_ARG_WITH(
 	[ if test "x$with_asterisk" = "xyes" -o "x$with_asterisk" = "xno" ; then  AC_MSG_ERROR([Invalid --with-asterisk=path value]); fi ],
 	[ with_asterisk="../include /usr/include /usr/local/include /opt/local/include" ]
 )
+dnl  Set iconv headers patch
+AC_ARG_WITH(
+	[iconv],
+	AS_HELP_STRING([--with-iconv=path], [set iconv headers location]),
+	[ if test "x$with_iconv" = "xyes" -o "x$with_iconv" = "xno" ; then  AC_MSG_ERROR([Invalid --with-iconv=path value]); fi ],
+	[ with_iconv="../include /usr/include /usr/local/include /opt/local/include" ]
+)
 
 dnl  Required: asterisk version
 AC_ARG_WITH(
@@ -75,9 +82,9 @@ if test -z "$RM" ; then
 fi
 
 dnl Checks for libraries.
-dnl AC_CHECK_LIB([pthread], [pthread_create])
-dnl AC_CHECK_LIB([iconv], [iconv])
-AC_SEARCH_LIBS([iconv], [c iconv])
+dnl AC_CHECK_LIB([pthread], [pthread_create])  # should use ast_pthread_join everywhere?
+AC_SEARCH_LIBS([iconv], [c iconv],,AC_MSG_ERROR([iconv library missing]))
+AC_CHECK_LIB([sqlite3], [sqlite3_open],,AC_MSG_ERROR([sqlite3 library missing]))
 
 dnl Checks for header files.
 AC_CHECK_HEADERS([fcntl.h stdlib.h string.h sys/time.h termios.h])
@@ -102,7 +109,8 @@ AC_DEFUN([AC_HEADER_FIND], [
 )
 
 AC_HEADER_FIND([asterisk.h], $with_asterisk)
-AC_HEADER_FIND([iconv.h], /usr/include /usr/local/include /opt/local/include)
+AC_HEADER_FIND([iconv.h], $with_iconv)
+AC_CHECK_HEADER([sqlite3.h],,AC_MSG_ERROR([sqlite3.h header file missing]))
 
 AC_DEFINE([ICONV_CONST],[], [Define to const if you has iconv() const declaration of input buffer])
 AC_MSG_CHECKING([for iconv use const inbuf])

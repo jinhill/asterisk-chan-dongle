@@ -24,6 +24,7 @@
 #include "cpvt.h"				/* struct cpvt */
 #include "export.h"				/* EXPORT_DECL EXPORT_DEF */
 #include "dc_config.h"				/* pvt_config_t */
+#include "at_command.h"
 
 #define MODULE_DESCRIPTION	"Huawei 3G Dongle Channel Driver"
 #define MAXDONGLEDEVICES	128
@@ -101,6 +102,11 @@ typedef struct pvt_stat
 
 struct at_queue_task;
 
+typedef unsigned int sms_inbox_item_type;
+
+#define SMS_INBOX_ITEM_BITS     (sizeof(sms_inbox_item_type) * 8)
+#define SMS_INBOX_ARRAY_SIZE    ((SMS_INDEX_MAX + SMS_INBOX_ITEM_BITS - 1) / SMS_INBOX_ITEM_BITS)
+
 typedef struct pvt
 {
 	AST_LIST_ENTRY (pvt)	entry;				/*!< linked list pointers */
@@ -144,8 +150,6 @@ typedef struct pvt
 
 	/* device caps */
 	unsigned int		use_ucs2_encoding:1;
-	unsigned int		cusd_use_7bit_encoding:1;
-	unsigned int		cusd_use_ucs2_decoding:1;
 
 	/* device state */
 	int			gsm_reg_status;
@@ -163,6 +167,9 @@ typedef struct pvt
 	char			cell_id[8];
 	char			sms_scenter[20];
 
+	unsigned int		incoming_sms_index;
+	sms_inbox_item_type	incoming_sms_inbox[SMS_INBOX_ARRAY_SIZE];
+
 	volatile unsigned int	connected:1;			/*!< do we have an connection to a device */
 	unsigned int		initialized:1;			/*!< whether a service level connection exists or not */
 	unsigned int		gsm_registered:1;		/*!< do we have an registration to a GSM */
@@ -170,12 +177,10 @@ typedef struct pvt
 	unsigned int		ring:1;				/*!< HW state; true if has incoming call from first RING until CEND or CONN */
 	unsigned int		cwaiting:1;			/*!< HW state; true if has incoming call waiting from first CCWA until CEND or CONN for */
 	unsigned int		outgoing_sms:1;			/*!< outgoing sms */
-	unsigned int		incoming_sms:1;			/*!< incoming sms */
 	unsigned int		volume_sync_step:2;		/*!< volume synchronized stage */
 #define VOLUME_SYNC_BEGIN	0
 #define VOLUME_SYNC_DONE	3
 
-	unsigned int		use_pdu:1;			/*!< PDU SMS mode in force */
 	unsigned int		has_sms:1;			/*!< device has SMS support */
 	unsigned int		has_voice:1;			/*!< device has voice call support */
 	unsigned int		has_call_waiting:1;		/*!< call waiting enabled on device */
@@ -222,6 +227,10 @@ typedef struct public_state
 
 EXPORT_DECL public_state_t * gpublic;
 
+EXPORT_DEF int sms_inbox_set(struct pvt* pvt, int index);
+EXPORT_DEF int sms_inbox_clear(struct pvt* pvt, int index);
+EXPORT_DEF int is_sms_inbox_set(const struct pvt* pvt, int index);
+
 EXPORT_DECL void clean_read_data(const char * devname, int fd);
 EXPORT_DECL int pvt_get_pseudo_call_idx(const struct pvt * pvt);
 EXPORT_DECL int ready4voice_call(const struct pvt* pvt, const struct cpvt * current_cpvt, int opts);
@@ -250,7 +259,7 @@ INLINE_DECL struct pvt * find_device (const char* name)
 	return find_device_ex(gpublic, name);
 }
 
-EXPORT_DECL struct pvt * find_device_ext(const char* name, const char ** reason);
+EXPORT_DECL struct pvt * find_device_ext(const char* name);
 EXPORT_DECL struct pvt * find_device_by_resource_ex(struct public_state * state, const char * resource, int opts, const struct ast_channel * requestor, int * exists);
 EXPORT_DECL void pvt_dsp_setup(struct pvt * pvt, const char * id, dc_dtmf_setting_t dtmf_new);
 
